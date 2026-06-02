@@ -1,0 +1,23 @@
+{
+  "name": "elyonis-license",
+  "version": "0.1.0",
+  "description": "License activation server for Elyonis",
+  "private": true,
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "init-db": "node scripts/init-db.js",
+    "generate-keys": "node scripts/generate-keys.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.0",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
