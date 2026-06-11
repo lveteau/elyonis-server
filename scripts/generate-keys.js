@@ -10,11 +10,11 @@
 //   notes     = empty
 //
 // Example:
-//   node --env-file-if-exists=.env scripts/generate-keys.js 100 perpetual
-//   node --env-file-if-exists=.env scripts/generate-keys.js 25 subscription 1798761600 "Q3 2026 batch"
+//   node scripts/generate-keys.js 100 perpetual
+//   node scripts/generate-keys.js 25 subscription 1798761600 "Q3 2026 batch"
 // =============================================================
 
-import { pool, stmts, nowSec, initDb } from '../src/db.js';
+import { db, stmts, nowSec } from '../src/db.js';
 import { randomKey } from '../src/keys.js';
 
 const count     = parseInt(process.argv[2] ?? '10', 10);
@@ -31,38 +31,21 @@ if ((type === 'subscription' || type === 'trial') && !expiresAt) {
     process.exit(1);
 }
 
-await initDb();
-
 const now = nowSec();
+const insert = db.transaction(keys => {
+    for (const k of keys) stmts.insertKey.run(k, now, type, expiresAt, notes);
+});
 
-// Generate unique keys (collision check against the DB).
 const fresh = [];
 let tries = 0;
 while (fresh.length < count && tries < count * 4) {
     tries++;
     const k = randomKey();
-    if (await stmts.findKey(k)) continue;   // collision (extremely unlikely)
+    if (stmts.findKey.get(k)) continue;   // collision (extremely unlikely)
     fresh.push(k);
 }
 
-// Insert them atomically in one transaction.
-const client = await pool.connect();
-try {
-    await client.query('BEGIN');
-    for (const k of fresh) {
-        await client.query(
-            `INSERT INTO licenses(key, status, created_at, type, expires_at, notes)
-             VALUES ($1, 'pool', $2, $3, $4, $5)`,
-            [k, now, type, expiresAt, notes]
-        );
-    }
-    await client.query('COMMIT');
-} catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-} finally {
-    client.release();
-}
+insert(fresh);
 
 // CSV out so it's trivial to import into a spreadsheet for ops.
 console.log('key,type,expiresAt,createdAt');
@@ -70,5 +53,3 @@ for (const k of fresh) {
     console.log(`${k},${type},${expiresAt ?? ''},${now}`);
 }
 console.error(`Generated ${fresh.length} keys.`);
-
-await pool.end();

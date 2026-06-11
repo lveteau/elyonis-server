@@ -1,11 +1,5 @@
-# Render Blueprint -- one web service + a managed PostgreSQL database.
+# Render Blueprint -- single web service + persistent disk for SQLite.
 # Connect this repo to Render and choose "Blueprint" so it reads this file.
-
-databases:
-  - name: elyonis-db
-    plan: free            # free Postgres (expires after 90 days; switch to a
-                          # paid plan for production). Region must match the web service.
-    region: frankfurt
 
 services:
   - type: web
@@ -19,17 +13,20 @@ services:
     startCommand: npm start
     healthCheckPath: /api/health
     autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data     # persistent SQLite home -- survives deploys / restarts
+      sizeGB: 1            # plenty for ~1M license rows; $0.25 / GB / month
     envVars:
-      # Connection string for the managed Postgres above -- injected by Render.
-      - key: DATABASE_URL
-        fromDatabase:
-          name: elyonis-db
-          property: connectionString
+      # The DB lives on the persistent disk so it isn't wiped each deploy.
+      - key: DB_PATH
+        value: /data/licenses.db
       # Render exposes the listening port via the PORT env var (random).
       - key: PORT
         sync: false        # Render injects automatically
       # Secrets: set the actual values in the Render dashboard ("Environment"
-      # tab) so they don't end up in git.
+      # tab) so they don't end up in git. The `generateValue: true` line
+      # would also work but harder to recover if you need to re-deploy.
       - key: HMAC_SECRET
         sync: false
       - key: ADMIN_TOKEN

@@ -1,5 +1,5 @@
 // =============================================================
-// Elyonis license server -- Express + PostgreSQL (node-postgres).
+// Elyonis license server -- Express + better-sqlite3.
 //
 // Public:
 //   POST /api/license/activate    { key, machineId }
@@ -8,7 +8,6 @@
 //
 // Admin (Bearer ADMIN_TOKEN):
 //   GET  /api/admin/keys
-//   POST /api/admin/keys
 //   POST /api/admin/keys/:key/revoke
 //   POST /api/admin/keys/:key/reset
 // =============================================================
@@ -17,7 +16,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
-import { stmts, nowSec, initDb } from './db.js';
+import { db, stmts, nowSec } from './db.js';
 import { randomKey } from './keys.js';
 import * as hmac from './hmac.js';
 
@@ -32,20 +31,16 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '4kb' }));
 
-// Trust the upstream proxy (Render / Cloudflare) so req.ip == real client IP.
+// Trust the upstream proxy (Cloudflare Tunnel) so req.ip == real client IP.
 app.set('trust proxy', 1);
 
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
-// Wrap async route handlers so a rejected promise becomes next(err)
-// instead of an unhandled rejection (Express 4 doesn't await handlers).
-const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-// Fire-and-forget audit write; never blocks the response.
 function logEvent(key, event, machineId, ip, detail) {
-    stmts.logEvent(key, event, machineId ?? null, ip ?? null, detail ?? null, nowSec())
-        .catch((e) => console.error('logEvent failed:', e.message));
+    try { stmts.logEvent.run(key, event, machineId ?? null, ip ?? null,
+                              detail ?? null, nowSec()); }
+    catch (e) { console.error('logEvent failed:', e.message); }
 }
 
 function isExpired(lic, now) {
@@ -70,12 +65,12 @@ const activateLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5,
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'too-many-attempts' } });
 
-app.post('/api/license/activate', activateLimiter, ah(async (req, res) => {
+app.post('/api/license/activate', activateLimiter, (req, res) => {
     const parsed = ActivateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId } = parsed.data;
 
-    const lic = await stmts.findKey(key);
+    const lic = stmts.findKey.get(key);
     if (!lic) {
         logEvent(key, 'reject', machineId, req.ip, 'not-found');
         return res.status(404).json({ error: 'unknown-key' });
@@ -98,7 +93,7 @@ app.post('/api/license/activate', activateLimiter, ah(async (req, res) => {
             logEvent(key, 'reject', machineId, req.ip, 'machine-mismatch');
             return res.status(409).json({ error: 'in-use-elsewhere' });
         }
-        await stmts.touchVerify(now, key, machineId);
+        stmts.touchVerify.run(now, key, machineId);
         const token = hmac.sign({
             key, machineId, type: lic.type,
             expiresAt: lic.expires_at, issuedAt: now, v: 1,
@@ -109,7 +104,7 @@ app.post('/api/license/activate', activateLimiter, ah(async (req, res) => {
     }
 
     // Fresh activation: pool -> activated.
-    const r = await stmts.activate(machineId, now, now, key);
+    const r = stmts.activate.run(machineId, now, now, key);
     if (r.changes !== 1) {
         // Race: another concurrent /activate beat us to it.
         logEvent(key, 'reject', machineId, req.ip, 'race-lost');
@@ -122,7 +117,7 @@ app.post('/api/license/activate', activateLimiter, ah(async (req, res) => {
     logEvent(key, 'activate', machineId, req.ip, 'fresh');
     return res.json({ ok: true, token, type: lic.type,
                       expiresAt: lic.expires_at });
-}));
+});
 
 // Verify: heartbeat. Lighter rate limit -- a healthy client calls
 // at most once per startup + once per N days in the background.
@@ -130,7 +125,7 @@ const verifyLimiter = rateLimit({ windowMs: 60 * 1000, max: 30,
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'too-many-requests' } });
 
-app.post('/api/license/verify', verifyLimiter, ah(async (req, res) => {
+app.post('/api/license/verify', verifyLimiter, (req, res) => {
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId, token } = parsed.data;
@@ -142,7 +137,7 @@ app.post('/api/license/verify', verifyLimiter, ah(async (req, res) => {
         return res.status(401).json({ error: 'bad-token' });
     }
 
-    const lic = await stmts.findKey(key);
+    const lic = stmts.findKey.get(key);
     if (!lic || lic.status !== 'activated' || lic.machine_id !== machineId) {
         logEvent(key, 'reject', machineId, req.ip, 'not-activated');
         return res.status(403).json({ error: 'not-activated' });
@@ -153,7 +148,7 @@ app.post('/api/license/verify', verifyLimiter, ah(async (req, res) => {
         return res.status(403).json({ error: 'expired' });
     }
 
-    await stmts.touchVerify(now, key, machineId);
+    stmts.touchVerify.run(now, key, machineId);
     // Re-issue a fresh token so the client's offline grace period
     // restarts each successful verify.
     const newToken = hmac.sign({
@@ -162,9 +157,9 @@ app.post('/api/license/verify', verifyLimiter, ah(async (req, res) => {
     });
     logEvent(key, 'verify', machineId, req.ip, null);
     return res.json({ ok: true, token: newToken, expiresAt: lic.expires_at });
-}));
+});
 
-app.post('/api/license/deactivate', verifyLimiter, ah(async (req, res) => {
+app.post('/api/license/deactivate', verifyLimiter, (req, res) => {
     const parsed = DeactivateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { key, machineId, token } = parsed.data;
@@ -175,14 +170,14 @@ app.post('/api/license/deactivate', verifyLimiter, ah(async (req, res) => {
         return res.status(401).json({ error: 'bad-token' });
     }
 
-    const r = await stmts.deactivate(key, machineId);
+    const r = stmts.deactivate.run(key, machineId);
     if (r.changes !== 1) {
         logEvent(key, 'reject', machineId, req.ip, 'deactivate-mismatch');
         return res.status(409).json({ error: 'not-activated-here' });
     }
     logEvent(key, 'deactivate', machineId, req.ip, null);
     return res.json({ ok: true });
-}));
+});
 
 // ---------------------------------------------------------------
 // Admin
@@ -196,12 +191,12 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-app.get('/api/admin/keys', requireAdmin, ah(async (req, res) => {
+app.get('/api/admin/keys', requireAdmin, (req, res) => {
     const limit  = Math.min(parseInt(req.query.limit  ?? '100', 10), 1000);
     const offset = parseInt(req.query.offset ?? '0', 10);
-    const rows = await stmts.listKeys(limit, offset);
+    const rows = stmts.listKeys.all(limit, offset);
     res.json({ ok: true, rows });
-}));
+});
 
 // Create a fresh key in the pool. Called by the Elyonis website after
 // a successful Stripe checkout: the website POSTs the order details,
@@ -217,7 +212,7 @@ const AdminCreateSchema = z.object({
     notes: z.string().max(256).optional(),
 });
 
-app.post('/api/admin/keys', requireAdmin, ah(async (req, res) => {
+app.post('/api/admin/keys', requireAdmin, (req, res) => {
     const parsed = AdminCreateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
     const { type, durationDays, notes } = parsed.data;
@@ -238,30 +233,35 @@ app.post('/api/admin/keys', requireAdmin, ah(async (req, res) => {
     let key = null;
     for (let i = 0; i < 8; i++) {
         const candidate = randomKey();
-        if (!(await stmts.findKey(candidate))) { key = candidate; break; }
+        if (!stmts.findKey.get(candidate)) { key = candidate; break; }
     }
     if (!key) return res.status(500).json({ error: 'key-generation-failed' });
 
-    await stmts.insertKey(key, now, type, expiresAt, notes ?? null);
+    stmts.insertKey.run(key, now, type, expiresAt, notes ?? null);
     logEvent(key, 'create', null, req.ip, `admin/${type}`);
     res.status(201).json({ ok: true, key, type, expiresAt });
-}));
+});
 
-app.post('/api/admin/keys/:key/revoke', requireAdmin, ah(async (req, res) => {
-    const r = await stmts.revokeKey(req.params.key);
+app.post('/api/admin/keys/:key/revoke', requireAdmin, (req, res) => {
+    const r = stmts.revokeKey.run(req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
     logEvent(req.params.key, 'revoke', null, req.ip, 'admin');
     res.json({ ok: true });
-}));
+});
 
 // Force-reset (back to pool). Used when a licensee lost their old
 // machine and can't /deactivate from there.
-app.post('/api/admin/keys/:key/reset', requireAdmin, ah(async (req, res) => {
-    const r = await stmts.resetKey(req.params.key);
+app.post('/api/admin/keys/:key/reset', requireAdmin, (req, res) => {
+    const r = db.prepare(`
+        UPDATE licenses
+        SET status='pool', machine_id=NULL,
+            activated_at=NULL, last_verify_at=NULL
+        WHERE key = ? AND status != 'revoked'
+    `).run(req.params.key);
     if (r.changes !== 1) return res.status(404).json({ error: 'unknown-key' });
     logEvent(req.params.key, 'reset', null, req.ip, 'admin');
     res.json({ ok: true });
-}));
+});
 
 // ---------------------------------------------------------------
 // Health
@@ -272,21 +272,6 @@ app.get('/api/health', (_req, res) => {
 
 app.use((_req, res) => res.status(404).json({ error: 'not-found' }));
 
-// Central error handler -- async handlers route rejections here.
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
-    console.error('request error:', err);
-    res.status(500).json({ error: 'server-error' });
+app.listen(PORT, () => {
+    console.log(`elyonis-license server listening on :${PORT}`);
 });
-
-// Ensure the schema exists before accepting traffic.
-initDb()
-    .then(() => {
-        app.listen(PORT, () => {
-            console.log(`elyonis-license server listening on :${PORT}`);
-        });
-    })
-    .catch((e) => {
-        console.error('DB init failed:', e);
-        process.exit(1);
-    });
