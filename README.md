@@ -12,11 +12,25 @@ All routes return JSON.
 | POST   | `/api/license/activate`           | none          | `{key, machineId}`                |
 | POST   | `/api/license/verify`             | none          | `{key, machineId, token}`         |
 | POST   | `/api/license/deactivate`         | none          | `{key, machineId, token}`         |
-| GET    | `/api/admin/keys`                 | Bearer ADMIN  | `?limit=100&offset=0`             |
+| GET    | `/api/admin/keys`                 | Bearer ADMIN  | `?limit=100&offset=0&status=&type=&q=` |
 | POST   | `/api/admin/keys`                 | Bearer ADMIN  | `{type, durationDays?, notes?}`   |
 | POST   | `/api/admin/keys/:key/revoke`     | Bearer ADMIN  |                                   |
 | POST   | `/api/admin/keys/:key/reset`      | Bearer ADMIN  |                                   |
+| GET    | `/api/admin/stats`                | Bearer ADMIN  |                                   |
 | GET    | `/api/health`                     | none          |                                   |
+
+`GET /api/admin/keys` filters (all optional, omitting them returns everything
+as before): `status` is `pool|activated|revoked|expired`, `type` is
+`perpetual|subscription|trial`, `q` matches the key (dash- and case-insensitive)
+or the notes field. The response carries `{ok, rows, total, limit, offset}` —
+`total` counts the whole filtered set, not the returned page.
+
+`GET /api/admin/stats` powers the admin dashboard (`elyonis-dashboard`):
+aggregate key counts, account counts, a 30-day created/activated series, and
+the last 15 audit events. Note `status` has no `expired` value in the schema —
+expiry is derived from `expires_at` at read time, so an `activated` key can
+also be expired. Hence `accounts.total` (ever activated) vs `accounts.live`
+(activated and not expired).
 
 Public endpoints are rate-limited (5 activates / 15 min / IP; 30 verifies / min / IP).
 

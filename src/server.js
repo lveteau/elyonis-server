@@ -191,11 +191,123 @@ function requireAdmin(req, res, next) {
     next();
 }
 
+// Filters are optional and default to "everything", so the pre-filter
+// callers (curl, the website) keep working unchanged. `status=expired`
+// is a virtual value: expiry is derived from expires_at, not stored in
+// the status column.
+const ListQuerySchema = z.object({
+    limit:  z.coerce.number().int().min(1).max(1000).default(100),
+    offset: z.coerce.number().int().min(0).default(0),
+    status: z.enum(['pool', 'activated', 'revoked', 'expired']).optional(),
+    type:   z.enum(['perpetual', 'subscription', 'trial']).optional(),
+    q:      z.string().trim().min(1).max(64).optional(),
+});
+
 app.get('/api/admin/keys', requireAdmin, (req, res) => {
-    const limit  = Math.min(parseInt(req.query.limit  ?? '100', 10), 1000);
-    const offset = parseInt(req.query.offset ?? '0', 10);
-    const rows = stmts.listKeys.all(limit, offset);
-    res.json({ ok: true, rows });
+    const parsed = ListQuerySchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'invalid-query' });
+    const { limit, offset, status, type, q } = parsed.data;
+
+    const where = [];
+    const params = { now: nowSec() };
+
+    if (status === 'expired') {
+        where.push(`type != 'perpetual' AND expires_at IS NOT NULL AND expires_at <= @now`);
+    } else if (status) {
+        where.push('status = @status');
+        params.status = status;
+    }
+    if (type) {
+        where.push('type = @type');
+        params.type = type;
+    }
+    if (q) {
+        // Key search is case-insensitive and ignores the dashes so an
+        // admin can paste "xgvjx9yy5s" or the formatted key and hit the
+        // same row. Notes hold the customer email / order id.
+        where.push(`(REPLACE(key,'-','') LIKE @qkey OR notes LIKE @qnotes)`);
+        params.qkey   = `%${q.replace(/-/g, '').toUpperCase()}%`;
+        params.qnotes = `%${q}%`;
+    }
+
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const rows = db.prepare(`
+        SELECT * FROM licenses ${clause}
+        ORDER BY created_at DESC LIMIT @limit OFFSET @offset
+    `).all({ ...params, limit, offset });
+
+    // Total for the same filter set, so a paginated client knows how
+    // many pages exist without walking them.
+    const { total } = db.prepare(
+        `SELECT COUNT(*) AS total FROM licenses ${clause}`
+    ).get(params);
+
+    res.json({ ok: true, rows, total, limit, offset });
+});
+
+// Aggregate counters + daily series for the admin dashboard. Cheap
+// enough to compute per request at license scale (a handful of full
+// scans over a table that stays in page cache).
+app.get('/api/admin/stats', requireAdmin, (req, res) => {
+    const now = nowSec();
+    const day = 86400;
+    const c = stmts.counts.get({
+        now,
+        since24h: now - day,
+        since7d:  now - 7 * day,
+        since30d: now - 30 * day,
+    });
+
+    // SUM() over zero rows is NULL, not 0 -- normalise so a fresh DB
+    // renders as zeros rather than blanks.
+    const n = (v) => v ?? 0;
+    const windowStart = now - 30 * day;
+    const created   = new Map(stmts.createdSeries.all(windowStart).map(r => [r.day, r.n]));
+    const activated = new Map(stmts.activatedSeries.all(windowStart).map(r => [r.day, r.n]));
+
+    // Emit every day in the window, including the empty ones, so the
+    // client can render a continuous axis without filling gaps itself.
+    const series = [];
+    for (let i = 29; i >= 0; i--) {
+        const day_ = new Date((now - i * day) * 1000).toISOString().slice(0, 10);
+        series.push({
+            day: day_,
+            created: created.get(day_) ?? 0,
+            activated: activated.get(day_) ?? 0,
+        });
+    }
+
+    res.json({
+        ok: true,
+        generatedAt: now,
+        keys: {
+            total:   n(c.total),
+            pool:    n(c.pool),
+            revoked: n(c.revoked),
+            expired: n(c.expired),
+        },
+        accounts: {
+            // Every activated key is locked to exactly one machine, so
+            // "activated" is also the end-user account count. `live`
+            // excludes the ones whose subscription has run out.
+            total: n(c.activated),
+            live:  n(c.live_accounts),
+        },
+        byType: {
+            perpetual:    n(c.perpetual),
+            subscription: n(c.subscription),
+            trial:        n(c.trial),
+        },
+        recent: {
+            created24h:   n(c.created_24h),
+            created7d:    n(c.created_7d),
+            created30d:   n(c.created_30d),
+            activated7d:  n(c.activated_7d),
+            activated30d: n(c.activated_30d),
+        },
+        series,
+        events: stmts.recentEvents.all(15),
+    });
 });
 
 // Create a fresh key in the pool. Called by the Elyonis website after

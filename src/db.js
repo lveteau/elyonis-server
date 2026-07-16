@@ -122,8 +122,53 @@ export const stmts = {
     INSERT INTO licenses(key, status, created_at, type, expires_at, notes)
     VALUES (?, 'pool', ?, ?, ?, ?)
   `),
-  listKeys:    db.prepare(`SELECT * FROM licenses ORDER BY created_at DESC LIMIT ? OFFSET ?`),
   revokeKey:   db.prepare(`UPDATE licenses SET status = 'revoked' WHERE key = ?`),
+
+  // Aggregate counters for the admin dashboard. Expiry is derived rather
+  // than stored (nothing sweeps expired rows into a status), so every
+  // "is it still live" test has to repeat the isExpired() predicate:
+  // perpetual keys and NULL expires_at never expire.
+  counts: db.prepare(`
+    SELECT
+      COUNT(*)                                             AS total,
+      SUM(status = 'pool')                                 AS pool,
+      SUM(status = 'activated')                            AS activated,
+      SUM(status = 'revoked')                              AS revoked,
+      SUM(type = 'perpetual')                              AS perpetual,
+      SUM(type = 'subscription')                           AS subscription,
+      SUM(type = 'trial')                                  AS trial,
+      SUM(type != 'perpetual' AND expires_at IS NOT NULL
+          AND expires_at <= @now)                          AS expired,
+      SUM(status = 'activated' AND (type = 'perpetual'
+          OR expires_at IS NULL OR expires_at > @now))     AS live_accounts,
+      SUM(created_at >= @since24h)                         AS created_24h,
+      SUM(created_at >= @since7d)                          AS created_7d,
+      SUM(created_at >= @since30d)                         AS created_30d,
+      SUM(activated_at IS NOT NULL
+          AND activated_at >= @since7d)                    AS activated_7d,
+      SUM(activated_at IS NOT NULL
+          AND activated_at >= @since30d)                   AS activated_30d
+    FROM licenses
+  `),
+
+  // Daily buckets for the dashboard sparkline. Two passes (created /
+  // activated) rather than one, because a key created on day A and
+  // activated on day B belongs to a different bucket in each series.
+  createdSeries: db.prepare(`
+    SELECT date(created_at, 'unixepoch') AS day, COUNT(*) AS n
+    FROM licenses WHERE created_at >= ?
+    GROUP BY day ORDER BY day
+  `),
+  activatedSeries: db.prepare(`
+    SELECT date(activated_at, 'unixepoch') AS day, COUNT(*) AS n
+    FROM licenses WHERE activated_at IS NOT NULL AND activated_at >= ?
+    GROUP BY day ORDER BY day
+  `),
+
+  recentEvents: db.prepare(`
+    SELECT id, key, event, machine_id, detail, created_at
+    FROM license_events ORDER BY created_at DESC, id DESC LIMIT ?
+  `),
 
   logEvent: db.prepare(`
     INSERT INTO license_events(key, event, machine_id, ip, detail, created_at)
