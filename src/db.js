@@ -49,6 +49,16 @@ db.exec(`
     type           TEXT NOT NULL CHECK (type IN ('perpetual','subscription','trial')),
     expires_at     INTEGER,         -- unix seconds, NULL = perpetual
 
+    -- Commercial pack, orthogonal to type (type = billing duration,
+    -- pack = feature set):
+    -- 'basic'   = accessibilité malvoyance (tout l'existant hors dictée)
+    -- 'premium' = basic + dictée vocale
+    -- 'pro'     = réservé, pas encore commercialisé
+    -- Default 'premium': rows created before packs existed had every
+    -- feature (dictée incluse) -- grandfather them rather than downgrade.
+    pack           TEXT NOT NULL DEFAULT 'premium'
+                   CHECK (pack IN ('basic','premium','pro')),
+
     -- Admin-only metadata: customer name, order id, batch label, etc.
     notes          TEXT
   );
@@ -73,13 +83,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_time ON license_events(created_at);
 `);
 
+// v1 -> v2: the pack column. ALTER on a live DB (CREATE TABLE IF NOT
+// EXISTS above only covers fresh files); the DEFAULT backfills every
+// pre-pack row as 'premium' (see the schema comment).
+const hasPack = db.prepare(
+  `SELECT COUNT(*) AS n FROM pragma_table_info('licenses') WHERE name = 'pack'`
+).get().n > 0;
+if (!hasPack) {
+  db.exec(`
+    ALTER TABLE licenses ADD COLUMN pack TEXT NOT NULL DEFAULT 'premium'
+      CHECK (pack IN ('basic','premium','pro'))
+  `);
+}
+
 // Bump schema_meta.version on every breaking migration so we can fail
 // fast if an old binary is pointed at a newer DB.
 const setVersion = db.prepare(`
   INSERT INTO schema_meta(key,value) VALUES ('version', ?)
   ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `);
-setVersion.run('1');
+setVersion.run('2');
 
 // ---------------------------------------------------------------
 // Prepared statements -- hot path.
@@ -119,8 +142,8 @@ export const stmts = {
 
   // Admin / bookkeeping.
   insertKey:  db.prepare(`
-    INSERT INTO licenses(key, status, created_at, type, expires_at, notes)
-    VALUES (?, 'pool', ?, ?, ?, ?)
+    INSERT INTO licenses(key, status, created_at, type, expires_at, pack, notes)
+    VALUES (?, 'pool', ?, ?, ?, ?, ?)
   `),
   revokeKey:   db.prepare(`UPDATE licenses SET status = 'revoked' WHERE key = ?`),
 
@@ -137,6 +160,9 @@ export const stmts = {
       SUM(type = 'perpetual')                              AS perpetual,
       SUM(type = 'subscription')                           AS subscription,
       SUM(type = 'trial')                                  AS trial,
+      SUM(pack = 'basic')                                  AS pack_basic,
+      SUM(pack = 'premium')                                AS pack_premium,
+      SUM(pack = 'pro')                                    AS pack_pro,
       SUM(type != 'perpetual' AND expires_at IS NOT NULL
           AND expires_at <= @now)                          AS expired,
       SUM(status = 'activated' AND (type = 'perpetual'

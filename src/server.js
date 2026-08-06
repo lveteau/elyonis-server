@@ -95,11 +95,11 @@ app.post('/api/license/activate', activateLimiter, (req, res) => {
         }
         stmts.touchVerify.run(now, key, machineId);
         const token = hmac.sign({
-            key, machineId, type: lic.type,
+            key, machineId, type: lic.type, pack: lic.pack,
             expiresAt: lic.expires_at, issuedAt: now, v: 1,
         });
         logEvent(key, 'activate', machineId, req.ip, 'idempotent');
-        return res.json({ ok: true, token, type: lic.type,
+        return res.json({ ok: true, token, type: lic.type, pack: lic.pack,
                           expiresAt: lic.expires_at });
     }
 
@@ -111,11 +111,11 @@ app.post('/api/license/activate', activateLimiter, (req, res) => {
         return res.status(409).json({ error: 'in-use-elsewhere' });
     }
     const token = hmac.sign({
-        key, machineId, type: lic.type,
+        key, machineId, type: lic.type, pack: lic.pack,
         expiresAt: lic.expires_at, issuedAt: now, v: 1,
     });
     logEvent(key, 'activate', machineId, req.ip, 'fresh');
-    return res.json({ ok: true, token, type: lic.type,
+    return res.json({ ok: true, token, type: lic.type, pack: lic.pack,
                       expiresAt: lic.expires_at });
 });
 
@@ -152,11 +152,12 @@ app.post('/api/license/verify', verifyLimiter, (req, res) => {
     // Re-issue a fresh token so the client's offline grace period
     // restarts each successful verify.
     const newToken = hmac.sign({
-        key, machineId, type: lic.type,
+        key, machineId, type: lic.type, pack: lic.pack,
         expiresAt: lic.expires_at, issuedAt: now, v: 1,
     });
     logEvent(key, 'verify', machineId, req.ip, null);
-    return res.json({ ok: true, token: newToken, expiresAt: lic.expires_at });
+    return res.json({ ok: true, token: newToken, pack: lic.pack,
+                      expiresAt: lic.expires_at });
 });
 
 app.post('/api/license/deactivate', verifyLimiter, (req, res) => {
@@ -200,13 +201,14 @@ const ListQuerySchema = z.object({
     offset: z.coerce.number().int().min(0).default(0),
     status: z.enum(['pool', 'activated', 'revoked', 'expired']).optional(),
     type:   z.enum(['perpetual', 'subscription', 'trial']).optional(),
+    pack:   z.enum(['basic', 'premium', 'pro']).optional(),
     q:      z.string().trim().min(1).max(64).optional(),
 });
 
 app.get('/api/admin/keys', requireAdmin, (req, res) => {
     const parsed = ListQuerySchema.safeParse(req.query);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-query' });
-    const { limit, offset, status, type, q } = parsed.data;
+    const { limit, offset, status, type, pack, q } = parsed.data;
 
     const where = [];
     const params = { now: nowSec() };
@@ -220,6 +222,10 @@ app.get('/api/admin/keys', requireAdmin, (req, res) => {
     if (type) {
         where.push('type = @type');
         params.type = type;
+    }
+    if (pack) {
+        where.push('pack = @pack');
+        params.pack = pack;
     }
     if (q) {
         // Key search is case-insensitive and ignores the dashes so an
@@ -298,6 +304,11 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
             subscription: n(c.subscription),
             trial:        n(c.trial),
         },
+        byPack: {
+            basic:   n(c.pack_basic),
+            premium: n(c.pack_premium),
+            pro:     n(c.pack_pro),
+        },
         recent: {
             created24h:   n(c.created_24h),
             created7d:    n(c.created_7d),
@@ -317,17 +328,21 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
 // Body:
 //   { type: 'perpetual' | 'subscription' | 'trial',
 //     durationDays?: number,   // mandatory unless type === 'perpetual'
+//     pack?: 'basic' | 'premium' | 'pro',  // feature set; defaults to
+//                               // 'basic' (entry-level commercial pack) so
+//                               // pre-pack callers keep minting valid keys
 //     notes?: string }          // e.g. customer email or order ID
 const AdminCreateSchema = z.object({
     type: z.enum(['perpetual', 'subscription', 'trial']),
     durationDays: z.number().int().positive().max(36500).optional(),
+    pack: z.enum(['basic', 'premium', 'pro']).default('basic'),
     notes: z.string().max(256).optional(),
 });
 
 app.post('/api/admin/keys', requireAdmin, (req, res) => {
     const parsed = AdminCreateSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'invalid-body' });
-    const { type, durationDays, notes } = parsed.data;
+    const { type, durationDays, pack, notes } = parsed.data;
 
     if ((type === 'subscription' || type === 'trial') && !durationDays) {
         return res.status(400).json({
@@ -349,9 +364,9 @@ app.post('/api/admin/keys', requireAdmin, (req, res) => {
     }
     if (!key) return res.status(500).json({ error: 'key-generation-failed' });
 
-    stmts.insertKey.run(key, now, type, expiresAt, notes ?? null);
-    logEvent(key, 'create', null, req.ip, `admin/${type}`);
-    res.status(201).json({ ok: true, key, type, expiresAt });
+    stmts.insertKey.run(key, now, type, expiresAt, pack, notes ?? null);
+    logEvent(key, 'create', null, req.ip, `admin/${type}/${pack}`);
+    res.status(201).json({ ok: true, key, type, pack, expiresAt });
 });
 
 app.post('/api/admin/keys/:key/revoke', requireAdmin, (req, res) => {

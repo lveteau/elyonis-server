@@ -12,8 +12,8 @@ All routes return JSON.
 | POST   | `/api/license/activate`           | none          | `{key, machineId}`                |
 | POST   | `/api/license/verify`             | none          | `{key, machineId, token}`         |
 | POST   | `/api/license/deactivate`         | none          | `{key, machineId, token}`         |
-| GET    | `/api/admin/keys`                 | Bearer ADMIN  | `?limit=100&offset=0&status=&type=&q=` |
-| POST   | `/api/admin/keys`                 | Bearer ADMIN  | `{type, durationDays?, notes?}`   |
+| GET    | `/api/admin/keys`                 | Bearer ADMIN  | `?limit=100&offset=0&status=&type=&pack=&q=` |
+| POST   | `/api/admin/keys`                 | Bearer ADMIN  | `{type, durationDays?, pack?, notes?}` |
 | POST   | `/api/admin/keys/:key/revoke`     | Bearer ADMIN  |                                   |
 | POST   | `/api/admin/keys/:key/reset`      | Bearer ADMIN  |                                   |
 | GET    | `/api/admin/stats`                | Bearer ADMIN  |                                   |
@@ -21,9 +21,10 @@ All routes return JSON.
 
 `GET /api/admin/keys` filters (all optional, omitting them returns everything
 as before): `status` is `pool|activated|revoked|expired`, `type` is
-`perpetual|subscription|trial`, `q` matches the key (dash- and case-insensitive)
-or the notes field. The response carries `{ok, rows, total, limit, offset}` —
-`total` counts the whole filtered set, not the returned page.
+`perpetual|subscription|trial`, `pack` is `basic|premium|pro`, `q` matches the
+key (dash- and case-insensitive) or the notes field. The response carries
+`{ok, rows, total, limit, offset}` — `total` counts the whole filtered set, not
+the returned page.
 
 `GET /api/admin/stats` powers the admin dashboard (`elyonis-dashboard`):
 aggregate key counts, account counts, a 30-day created/activated series, and
@@ -82,8 +83,10 @@ the persistent disk. Render offers an SSH shell on paid plans:
 
 ```bash
 # in Render dashboard → "Shell" tab on the service
-node scripts/generate-keys.js 100 perpetual > /data/batch-001.csv
-cat /data/batch-001.csv     # copy these into your fulfilment workflow
+# --pack defaults to basic; a Premium batch must say so (see Pricing model).
+node scripts/generate-keys.js 100 perpetual --pack=basic   > /data/batch-basic-001.csv
+node scripts/generate-keys.js 100 perpetual --pack=premium > /data/batch-premium-001.csv
+cat /data/batch-basic-001.csv   # copy these into your fulfilment workflow
 ```
 
 Alternative: generate keys locally (writes into `./data/licenses.db`), then
@@ -98,11 +101,33 @@ mint a key, then emails it to the customer.
 
 ### Pricing model (per Christopher / client)
 
+Two independent axes. `type` is the **billing duration**, `pack` is the **feature
+set** — any pack can be sold on any type.
+
 | Audience      | Plan                | `type`         | `durationDays` |
 | ------------- | ------------------- | -------------- | -------------- |
 | B2C (particulier) | Monthly, no commitment | `subscription` | 30             |
 | B2B (pro / AGEFIPH)  | Annual                | `subscription` | 365            |
 | Lifetime / one-shot  | Perpetual             | `perpetual`    | (omit)         |
+
+| `pack`    | Sold at launch | Features                                                       |
+| --------- | -------------- | -------------------------------------------------------------- |
+| `basic`   | yes            | Low-vision suite: zoom, filters, pointer, read-aloud, voice **commands** |
+| `premium` | yes            | Basique **+ voice dictation** (typing by voice)                  |
+| `pro`     | no (reserved)  | Treated as Premium by the client until it has its own features   |
+
+The client enforces this: `elyonis.exe` reads `pack` out of the signed
+activation token and closes **Voix → Dictée vocale** on `basic`, replacing the
+switch with a link to the clavtek.fr quote form. Everything else stays open —
+voice *commands* share the same recognition engine but belong to Basique, so
+never gate the mic on the pack.
+
+> **`POST /api/admin/keys` defaults `pack` to `basic`** (entry-level), while the
+> DB column defaults to `premium` (grandfathering rows created before packs
+> existed). So any caller that omits the field now mints a licence **without
+> dictation** — the website's Stripe flow must send `pack` explicitly for every
+> Premium sale. Keys minted before this shipped are unaffected: they carry
+> `premium` from the column default.
 
 For subscription plans the website re-issues a key extension on each
 successful renewal (call POST `/api/admin/keys` again? no -- prefer to
@@ -121,6 +146,7 @@ curl -X POST https://app.elyonis.fr/api/admin/keys \
     -d '{
         "type": "subscription",
         "durationDays": 30,
+        "pack": "premium",
         "notes": "customer@example.com / Stripe cs_test_..."
     }'
 
@@ -129,6 +155,7 @@ curl -X POST https://app.elyonis.fr/api/admin/keys \
     "ok": true,
     "key": "XGVJX-9YY5S-NBVBB-WFP8D-FHEJG",
     "type": "subscription",
+    "pack": "premium",
     "expiresAt": 1782983007
 }
 ```
@@ -171,6 +198,14 @@ The Elyonis client (`src/license/`) hardcodes:
 constexpr const wchar_t* LICENSE_BASE_URL = L"https://app.elyonis.fr";
 constexpr const char*    LICENSE_HMAC_PUBKEY = "<base64 of HMAC_SECRET>";
 ```
+
+The signed token payload is
+`{key, machineId, type, pack, expiresAt, issuedAt, v}`. `pack` is the client's
+only source of truth for feature gating (there is no separate entitlements
+call), and it is re-issued on every `/verify` — so an upgrade Basique →
+Premium in the DB reaches the client at its next heartbeat, without
+re-activation. Old tokens have no `pack` field; the client reads that as
+`premium`, matching the column default.
 
 `HMAC_SECRET` is a SHARED secret -- both server (to sign) and client (to
 verify offline). Treat it like a code-signing key: it ends up in every

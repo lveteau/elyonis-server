@@ -1,29 +1,46 @@
 // =============================================================
 // Generate N license keys and dump them as CSV on stdout.
 // =============================================================
-//   node scripts/generate-keys.js [count] [type] [expiresAt] [notes]
+//   node scripts/generate-keys.js [count] [type] [expiresAt] [notes] [--pack=X]
 //
 // Defaults:
 //   count     = 10
-//   type      = 'perpetual' | 'subscription' | 'trial'
+//   type      = 'perpetual' | 'subscription' | 'trial'  (billing duration)
 //   expiresAt = null (or unix seconds for subscription/trial)
 //   notes     = empty
+//   --pack    = 'basic' | 'premium' | 'pro'  (feature set) -- default 'basic',
+//               same default as POST /api/admin/keys. A batch destined to
+//               Premium customers MUST pass --pack=premium: the client reads
+//               the pack out of the activation token and a basic key ships
+//               WITHOUT voice dictation. Flag rather than a 5th positional so
+//               existing invocations keep working unchanged.
 //
 // Example:
 //   node scripts/generate-keys.js 100 perpetual
-//   node scripts/generate-keys.js 25 subscription 1798761600 "Q3 2026 batch"
+//   node scripts/generate-keys.js 25 subscription 1798761600 "Q3 2026 batch" --pack=premium
 // =============================================================
 
 import { db, stmts, nowSec } from '../src/db.js';
 import { randomKey } from '../src/keys.js';
 
-const count     = parseInt(process.argv[2] ?? '10', 10);
-const type      = process.argv[3] ?? 'perpetual';
-const expiresAt = process.argv[4] ? parseInt(process.argv[4], 10) : null;
-const notes     = process.argv[5] ?? null;
+// Pull the flag out first so it never lands in a positional slot, whatever
+// its place on the command line.
+const argv      = process.argv.slice(2);
+const packArg   = argv.find(a => a.startsWith('--pack='));
+const positional = argv.filter(a => !a.startsWith('--'));
+
+const count     = parseInt(positional[0] ?? '10', 10);
+const type      = positional[1] ?? 'perpetual';
+const expiresAt = positional[2] ? parseInt(positional[2], 10) : null;
+const notes     = positional[3] || null;   // '' (placeholder arg) -> null
+const pack      = packArg ? packArg.slice('--pack='.length) : 'basic';
 
 if (!['perpetual', 'subscription', 'trial'].includes(type)) {
     console.error(`Invalid type: ${type}`);
+    process.exit(1);
+}
+if (!['basic', 'premium', 'pro'].includes(pack)) {
+    console.error(`Invalid pack: ${pack} (expected basic|premium|pro)`);
     process.exit(1);
 }
 if ((type === 'subscription' || type === 'trial') && !expiresAt) {
@@ -33,7 +50,7 @@ if ((type === 'subscription' || type === 'trial') && !expiresAt) {
 
 const now = nowSec();
 const insert = db.transaction(keys => {
-    for (const k of keys) stmts.insertKey.run(k, now, type, expiresAt, notes);
+    for (const k of keys) stmts.insertKey.run(k, now, type, expiresAt, pack, notes);
 });
 
 const fresh = [];
@@ -47,9 +64,11 @@ while (fresh.length < count && tries < count * 4) {
 
 insert(fresh);
 
-// CSV out so it's trivial to import into a spreadsheet for ops.
-console.log('key,type,expiresAt,createdAt');
+// CSV out so it's trivial to import into a spreadsheet for ops. The pack is a
+// column of its own: a batch is worthless to ops if you can't tell which keys
+// carry dictation.
+console.log('key,type,pack,expiresAt,createdAt');
 for (const k of fresh) {
-    console.log(`${k},${type},${expiresAt ?? ''},${now}`);
+    console.log(`${k},${type},${pack},${expiresAt ?? ''},${now}`);
 }
 console.error(`Generated ${fresh.length} keys.`);
